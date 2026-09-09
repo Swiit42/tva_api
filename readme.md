@@ -16,26 +16,43 @@ en distinguant explicitement trois états — **valide**, **invalide**,
 - **psycopg2** — driver PostgreSQL utilisé en SQL brut (pas d'ORM) : les
   requêtes sont explicites, ce qui facilite la défense du modèle de
   données et de la logique de chargement à l'oral.
-- **FastAPI** (Phase 2) — API REST imposée par le brief.
+- **FastAPI** — API REST imposée par le brief, appelée par la
+  facturation avant chaque émission hors taxe.
+- **httpx** — client HTTP vers l'API REST VIES (synchrone, simple à
+  raisonner pour une campagne séquentielle avec temporisation).
 - **Docker / docker-compose** — isole PostgreSQL sans installation locale.
-- **pytest** — tests unitaires du module de validation structurelle
-  (53+ tests : un cas conforme et au moins un cas invalide par pays).
+- **pytest** — tests unitaires (module de validation structurelle,
+  pipeline, client VIES, API) : 67 tests, aucun ne nécessite le réseau
+  ni une base démarrée (les scripts de chargement/campagne/rapports, eux,
+  sont démontrés en conditions réelles, cf. plus bas).
+
+Voir aussi [note_architecture.md](note_architecture.md) (décisions et
+chiffrage) et [journal.md](journal.md) (déroulé jour par jour).
 
 ## Structure du dépôt
 
 ```
-data/                       jeu de données fourni (10 000 lignes, CSV + Excel)
-db/schema.sql               schéma PostgreSQL du référentiel
+data/                        jeu de données fourni (10 000 lignes, CSV + Excel)
+db/schema.sql                schéma PostgreSQL (référentiel + cache VIES + tentatives)
 src/tva_validation/
-  normalize.py               nettoyage générique d'un numéro brut
-  countries/                 un validateur par pays (format + clé de contrôle)
-  models.py                  ResultatValidation, taxonomie des motifs de rejet
-  pipeline.py                normalisation -> dispatch pays -> clé de dédoublonnage
-  db.py                      connexion PostgreSQL (lit DATABASE_URL)
+  normalize.py                nettoyage générique d'un numéro brut
+  countries/                  un validateur par pays (format + clé de contrôle)
+  models.py                   ResultatValidation, taxonomie des motifs de rejet
+  pipeline.py                 normalisation -> dispatch pays -> clé de dédoublonnage
+  db.py                       connexion PostgreSQL (lit DATABASE_URL)
+  config.py                   constantes partagées (fraîcheur, URL VIES...)
+  vies_client.py               appel VIES + interprétation userError -> verdict
+  verdicts_cache.py            lecture/écriture du cache de verdicts fermes
+  campagne.py                  campagne échantillon, temporisation, reprise
+  api.py                       API FastAPI (contrat verdict + origine + fraîcheur)
 scripts/
-  charger_referentiel.py     commande unique de chargement (upsert, idempotent)
-  rapport_motifs.py          répartition par motif + appels VIES évités
-tests/                       tests pytest (module de validation + pipeline)
+  charger_referentiel.py      commande unique de chargement (upsert, idempotent)
+  rapport_motifs.py           répartition par motif + appels VIES évités
+  lancer_campagne.py          CLI de la campagne de vérification VIES
+  rapport_reconciliation.py   rapport final (une commande)
+tests/                        tests pytest (module de validation, pipeline, VIES, API)
+note_architecture.md          décisions et chiffrage (une page)
+journal.md                    journal de bord jour par jour
 ```
 
 ## Lancer le projet depuis zéro
@@ -54,7 +71,12 @@ docker compose up -d            # démarre PostgreSQL sur le port 5435
 python scripts/charger_referentiel.py   # charge les 10 000 lignes (idempotent)
 python scripts/rapport_motifs.py        # répartition par motif + chiffrage VIES
 
-pytest                                  # 58 tests (module de validation structurelle)
+pytest                                  # 67 tests
+
+python scripts/lancer_campagne.py --echantillon 200   # campagne VIES (mode échantillon)
+python scripts/rapport_reconciliation.py               # rapport final (une commande)
+
+uvicorn tva_validation.api:app --app-dir src --reload  # API sur http://127.0.0.1:8000
 ```
 
 ## Où en est le pipeline (Phase 1)
@@ -95,17 +117,57 @@ appels évités (36,98%)** grâce au filtrage structurel et au
 dédoublonnage, avant même de lancer la campagne de vérification en ligne
 (Phase 2).
 
-## Décisions validées avec le commanditaire (Phase 1)
+## Phase 2 — VIES en direct, campagne, API
 
+Tests manuels sur l'endpoint REST VIES fourni (réponse JSON lue en
+entier avant tout code) : découverte, non cherchée, que FR et BE
+renvoient parfois `isValid: false` avec `userError: "MS_MAX_CONCURRENT_REQ"`
+(administration surchargée, VIES n'a rien vérifié). D'où la règle
+retenue : **c'est `userError` qui pilote le verdict, jamais `isValid`
+seul** (détails et mapping complet dans `vies_client.py` et la note
+d'architecture).
+
+**Campagne** (`scripts/lancer_campagne.py`) : mode échantillon par
+défaut, temporisation entre appels, journalisation (`logs/campagne_vies.log`),
+reprise sur interruption — testée en conditions réelles (campagne
+interrompue deux fois de suite, reprise exacte sans redémarrer à zéro ni
+retirer un nouvel échantillon).
+
+**API** (`src/tva_validation/api.py`) : `GET /verification-tva/{pays}/{numero}`
+renvoie toujours `verdict` + `origine` + `fraicheur` :
+
+```bash
+curl http://127.0.0.1:8000/verification-tva/PT/500697256
+# {"pays_declare":"PT","numero_tva":"PT500697256","verdict":"valide",
+#  "origine":"appel_frais","fraicheur":"...","motif":null}
+```
+
+| Origine | Signifie |
+|---|---|
+| `structurel` | rejeté avant tout appel VIES (certitude mathématique/périmètre) |
+| `cache` | verdict ferme connu, encore frais (< 30 jours) |
+| `appel_frais` | VIES vient de répondre fermement |
+| `cache_perime` | VIES injoignable, on sert un verdict ferme connu mais périmé |
+| `vies_injoignable_sans_cache` | VIES injoignable, rien en cache → `indetermine`, jamais `invalide` par défaut |
+
+## Décisions validées avec le commanditaire
+
+**Phase 1**
 - Les motifs de rejet structurel (`cle_controle_invalide`,
   `longueur_invalide`, `format_invalide`, `cle_controle_impossible`,
   `valeur_absente`, `pays_hors_perimetre`) sont des certitudes
   mathématiques ou de périmètre : verdict **invalide** direct, sans appel
   VIES. Le verdict **indéterminé** est réservé exclusivement aux cas où
-  VIES est injoignable (Phase 2) — jamais à un rejet structurel.
+  VIES est injoignable — jamais à un rejet structurel.
 - Un doublon est défini par la clé `(pays_declare, numero_normalise)`.
   Toutes les lignes du référentiel sont conservées ; seul l'appel VIES
   est mutualisé par clé unique.
+
+**Phase 2**
+- Un verdict ferme (valide/invalide) reste valable **30 jours**.
+- Si VIES est injoignable et qu'un verdict ferme périmé existe, on le
+  sert quand même, marqué `cache_perime` avec sa vraie date — jamais
+  perdu à cause d'une panne ponctuelle de VIES.
 
 ## Auteur
 
